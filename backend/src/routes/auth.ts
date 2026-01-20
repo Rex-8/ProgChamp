@@ -1,225 +1,171 @@
 import { Hono } from "hono";
+import { Google, generateState, generateCodeVerifier } from "arctic";
 import { db } from "../db/index";
 import { users } from "../db/schema";
 import { eq } from "drizzle-orm";
-import { z } from "zod";
+import { createSession, destroySession, getSession } from "../lib/session";
+import { setCookie, getCookie, deleteCookie } from "hono/cookie";
 
 const auth = new Hono();
 
-// Type helper for Drizzle returning
-type User = typeof users.$inferSelect;
+// Initialize Google OAuth
+const google = new Google(
+  process.env.GOOGLE_CLIENT_ID!,
+  process.env.GOOGLE_CLIENT_SECRET!,
+  process.env.GOOGLE_REDIRECT_URI!
+);
 
-// Google OAuth callback schema
-const googleAuthSchema = z.object({
-  googleId: z.string(),
-  email: z.string().email(),
-  name: z.string(),
-  avatarUrl: z.string().optional(),
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+// GET /auth/google - Initiate OAuth flow
+auth.get("/google", async (c) => {
+  const state = generateState();
+  const codeVerifier = generateCodeVerifier();
+  
+  const url = await google.createAuthorizationURL(state, codeVerifier, {
+    scopes: ["email"], // Minimal scope - only email
+  });
+  
+  // Store state and verifier in cookies for validation
+  setCookie(c, "google_oauth_state", state, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 60 * 10, // 10 minutes
+    path: "/",
+  });
+  
+  setCookie(c, "google_code_verifier", codeVerifier, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 60 * 10,
+    path: "/",
+  });
+  
+  return c.redirect(url.toString());
 });
 
-// POST /auth/google - Handle Google OAuth callback
-auth.post("/google", async (c) => {
-  const body = await c.req.json();
-  const result = googleAuthSchema.safeParse(body);
-
-  if (!result.success) {
-    return c.json({ error: "Invalid request data", details: result.error.format() }, 400);
+// GET /auth/google/callback - Handle OAuth callback
+auth.get("/google/callback", async (c) => {
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+  const storedState = getCookie(c, "google_oauth_state");
+  const codeVerifier = getCookie(c, "google_code_verifier");
+  
+  // Validate state to prevent CSRF
+  if (!code || !state || !storedState || state !== storedState || !codeVerifier) {
+    return c.redirect(`${FRONTEND_URL}/auth/error?message=Invalid OAuth state`);
   }
-
-  const { googleId, email, name, avatarUrl } = result.data;
-
+  
+  // Clean up state cookies
+  deleteCookie(c, "google_oauth_state");
+  deleteCookie(c, "google_code_verifier");
+  
   try {
+    // Exchange code for tokens
+    const tokens = await google.validateAuthorizationCode(code, codeVerifier);
+    
+    // Fetch user info from Google
+    const response = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+      headers: { Authorization: `Bearer ${tokens.accessToken}` },
+    });
+    
+    if (!response.ok) {
+      throw new Error("Failed to fetch user info from Google");
+    }
+    
+    const googleUser = await response.json() as {
+      id: string;
+      email: string;
+    };
+    
     // Check if user exists by Google ID
     const existingUser = await db.query.users.findFirst({
-      where: eq(users.googleId, googleId),
+      where: eq(users.googleId, googleUser.id),
     });
-
-    let user;
-
+    
     if (existingUser) {
-      // Check if account is deactivated
+      // Existing user - check if active
       if (!existingUser.isActive) {
-        return c.json({ 
-          error: "Account is deactivated",
-          message: "Your account has been deactivated. Please contact support to restore access.",
-          deactivatedAt: existingUser.deactivatedAt,
-        }, 403);
+        return c.redirect(`${FRONTEND_URL}/auth/error?message=Account deactivated`);
       }
-
-      // Update existing user
-      const updated = await db
-        .update(users)
-        .set({
-          email,
-          name,
-          avatarUrl,
-          updatedAt: new Date(),
-        })
-        .where(eq(users.id, existingUser.id))
-        .returning() as User[];
       
-      user = updated[0] ?? existingUser;
-    } else {
-      // Check if email is already in use (different Google account)
-      const emailExists = await db.query.users.findFirst({
-        where: eq(users.email, email),
-      });
-
-      if (emailExists) {
-        return c.json({ 
-          error: "Email already registered",
-          message: "This email is already associated with another account.",
-        }, 409);
-      }
-
-      // Create new user
-      const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const newUsers = await db
-        .insert(users)
-        .values({
-          id: userId,
-          googleId,
-          email,
-          name,
-          avatarUrl,
-          userType: "normal",
-          superlikesRemaining: 3,
-          isActive: true,
-        })
-        .returning() as User[];
-      
-      user = newUsers[0]!;
+      // Create session and redirect to home
+      await createSession(c, existingUser.id, existingUser.email);
+      return c.redirect(`${FRONTEND_URL}/home`);
     }
-
-    // TODO: In production, create JWT token here
-    // const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET!, { expiresIn: '7d' });
-
-    return c.json({
-      success: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        userType: user.userType,
-        superlikesRemaining: user.superlikesRemaining,
-        createdAt: user.createdAt,
-      },
-      // token, // Return this in production
+    
+    // New user - check if email already exists (different Google account)
+    const emailExists = await db.query.users.findFirst({
+      where: eq(users.email, googleUser.email),
     });
+    
+    if (emailExists) {
+      return c.redirect(`${FRONTEND_URL}/auth/error?message=Email already registered with different account`);
+    }
+    
+    // Create new user with minimal info
+    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    await db.insert(users).values({
+      id: userId,
+      googleId: googleUser.id,
+      email: googleUser.email,
+      name: null, // User will set this in profile setup
+      avatarUrl: null,
+      userType: "normal",
+      superlikesRemaining: 3,
+      isActive: true,
+    });
+    
+    // Create session
+    await createSession(c, userId, googleUser.email);
+    
+    // Redirect to profile setup
+    return c.redirect(`${FRONTEND_URL}/profile/setup`);
   } catch (error) {
-    console.error("Auth error:", error);
-    return c.json({ 
-      error: "Authentication failed",
-      message: "An error occurred during authentication. Please try again.",
-    }, 500);
+    console.error("OAuth callback error:", error);
+    return c.redirect(`${FRONTEND_URL}/auth/error?message=Authentication failed`);
   }
 });
 
-// GET /auth/me - Get current user (requires auth middleware)
-auth.get("/me", async (c) => {
-  // TODO: Add auth middleware to extract userId from JWT
-  const userId = c.req.header("X-User-Id"); // Temporary - replace with JWT parsing
-
-  if (!userId) {
-    return c.json({ error: "Unauthorized", message: "No authentication provided" }, 401);
+// GET /auth/session - Get current session
+auth.get("/session", async (c) => {
+  const session = await getSession(c);
+  
+  if (!session) {
+    return c.json({ authenticated: false }, 401);
   }
-
+  
   try {
     const user = await db.query.users.findFirst({
-      where: eq(users.id, userId),
+      where: eq(users.id, session.userId),
     });
-
-    if (!user) {
-      return c.json({ error: "User not found" }, 404);
+    
+    if (!user || !user.isActive) {
+      destroySession(c);
+      return c.json({ authenticated: false }, 401);
     }
-
-    if (!user.isActive) {
-      return c.json({ 
-        error: "Account deactivated",
-        message: "Your account has been deactivated.",
-        deactivatedAt: user.deactivatedAt,
-      }, 403);
-    }
-
+    
     return c.json({
+      authenticated: true,
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
         avatarUrl: user.avatarUrl,
         userType: user.userType,
-        superlikesRemaining: user.superlikesRemaining,
-        createdAt: user.createdAt,
+        needsProfileSetup: !user.name, // Flag for frontend
       },
     });
   } catch (error) {
-    console.error("Get user error:", error);
-    return c.json({ 
-      error: "Failed to fetch user",
-      message: "An error occurred while fetching user data.",
-    }, 500);
+    console.error("Session fetch error:", error);
+    return c.json({ authenticated: false }, 500);
   }
 });
 
-// POST /auth/logout
+// POST /auth/logout - Destroy session
 auth.post("/logout", async (c) => {
-  // TODO: In production, invalidate JWT token (add to blacklist or use short expiry with refresh tokens)
+  destroySession(c);
   return c.json({ success: true, message: "Logged out successfully" });
-});
-
-// DELETE /auth/account - Deactivate account (soft delete)
-auth.delete("/account", async (c) => {
-  const userId = c.req.header("X-User-Id");
-
-  if (!userId) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  const bodySchema = z.object({
-    reason: z.string().optional(),
-  });
-
-  const body = await c.req.json();
-  const result = bodySchema.safeParse(body);
-
-  if (!result.success) {
-    return c.json({ error: "Invalid request data" }, 400);
-  }
-
-  try {
-    const user = await db.query.users.findFirst({
-      where: eq(users.id, userId),
-    });
-
-    if (!user) {
-      return c.json({ error: "User not found" }, 404);
-    }
-
-    if (!user.isActive) {
-      return c.json({ error: "Account already deactivated" }, 400);
-    }
-
-    // Soft delete - deactivate account
-    await db
-      .update(users)
-      .set({
-        isActive: false,
-        deactivatedAt: new Date(),
-        deactivatedBy: userId,
-        deactivationReason: result.data.reason || "User requested deactivation",
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, userId));
-
-    return c.json({ 
-      success: true,
-      message: "Account deactivated. You have 30 days to restore your account.",
-    });
-  } catch (error) {
-    console.error("Deactivate account error:", error);
-    return c.json({ error: "Failed to deactivate account" }, 500);
-  }
 });
 
 export default auth;
