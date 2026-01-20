@@ -4,33 +4,60 @@ import { users } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { requireAuth } from "../lib/session";
+import { requireAdmin } from "../lib/admin";
 
 const profile = new Hono();
 
 // Validation schemas
 const profileSetupSchema = z.object({
-  name: z.string().min(1).max(100),
-  avatarUrl: z.string().url().optional(),
+  name: z.string()
+    .min(1, "Name is required")
+    .max(100, "Name too long")
+    .regex(/^[a-zA-Z0-9\s_-]+$/, "Name contains invalid characters"),
+  avatarUrl: z.string()
+    .url("Invalid avatar URL")
+    .optional()
+    .or(z.literal("")),
 });
 
 const profileUpdateSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
-  avatarUrl: z.string().url().optional(),
+  name: z.string()
+    .min(1, "Name is required")
+    .max(100, "Name too long")
+    .regex(/^[a-zA-Z0-9\s_-]+$/, "Name contains invalid characters")
+    .optional(),
+  avatarUrl: z.string()
+    .url("Invalid avatar URL")
+    .optional()
+    .or(z.literal("")),
+});
+
+const userIdParamSchema = z.object({
+  userId: z.string().min(1, "User ID is required"),
 });
 
 // GET /profile/public/:userId - Get public user details
 profile.get("/public/:userId", async (c) => {
   const userId = c.req.param("userId");
   
+  // Validate user ID
+  const paramValidation = userIdParamSchema.safeParse({ userId });
+  if (!paramValidation.success) {
+    return c.json({ 
+      error: "Invalid user ID",
+      details: paramValidation.error.format()
+    }, 400);
+  }
+  
   try {
     const user = await db.query.users.findFirst({
       where: eq(users.id, userId),
       columns: {
         id: true,
-        googleId: true,
         name: true,
         avatarUrl: true,
         email: true,
+        isActive: true,
       },
     });
     
@@ -43,7 +70,7 @@ profile.get("/public/:userId", async (c) => {
     }
     
     return c.json({
-      googleId: user.googleId,
+      id: user.id,
       name: user.name,
       avatarUrl: user.avatarUrl,
       email: user.email,
@@ -54,31 +81,20 @@ profile.get("/public/:userId", async (c) => {
   }
 });
 
-// GET /profile/privileged/:userId - Get all user details (admin only - basic version)
-profile.get("/privileged/:userId", async (c) => {
+// GET /profile/privileged/:userId - Get all user details (admin only)
+profile.get("/privileged/:userId", requireAdmin, async (c) => {
+  const userId = c.req.param("userId");
+  
+  // Validate user ID
+  const paramValidation = userIdParamSchema.safeParse({ userId });
+  if (!paramValidation.success) {
+    return c.json({ 
+      error: "Invalid user ID",
+      details: paramValidation.error.format()
+    }, 400);
+  }
+  
   try {
-    // Get current user session
-    const session = await requireAuth(c);
-    
-    // Get current user to check if admin
-    const currentUser = await db.query.users.findFirst({
-      where: eq(users.id, session.userId),
-    });
-    
-    if (!currentUser) {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
-    
-    // Basic admin check (you'll enforce this properly later)
-    if (currentUser.userType !== "admin") {
-      return c.json({ 
-        error: "Forbidden",
-        message: "Admin access required" 
-      }, 403);
-    }
-    
-    // Fetch target user
-    const userId = c.req.param("userId");
     const user = await db.query.users.findFirst({
       where: eq(users.id, userId),
     });
@@ -87,12 +103,9 @@ profile.get("/privileged/:userId", async (c) => {
       return c.json({ error: "User not found" }, 404);
     }
     
-    // Return all user fields
+    // Return all user fields for admin
     return c.json({ user });
   } catch (error) {
-    if (error instanceof Error && error.message === "Unauthorized") {
-      return c.json({ error: "Unauthorized" }, 401);
-    }
     console.error("Get privileged profile error:", error);
     return c.json({ error: "Failed to fetch profile" }, 500);
   }
@@ -124,6 +137,10 @@ profile.patch("/setup", async (c) => {
       return c.json({ error: "User not found" }, 404);
     }
     
+    if (!user.isActive) {
+      return c.json({ error: "Account is deactivated" }, 403);
+    }
+    
     // Check if profile already setup
     if (user.name) {
       return c.json({ 
@@ -142,6 +159,10 @@ profile.patch("/setup", async (c) => {
       })
       .where(eq(users.id, session.userId))
       .returning();
+    
+    if (!updated[0]) {
+      return c.json({ error: "Failed to setup profile" }, 500);
+    }
     
     return c.json({
       success: true,
@@ -178,10 +199,25 @@ profile.patch("/update", async (c) => {
     
     const updates = result.data;
     
+    // Check if user exists and is active
+    const user = await db.query.users.findFirst({
+      where: eq(users.id, session.userId),
+    });
+    
+    if (!user) {
+      return c.json({ error: "User not found" }, 404);
+    }
+    
+    if (!user.isActive) {
+      return c.json({ error: "Account is deactivated" }, 403);
+    }
+    
     // Build update object (only include provided fields)
     const updateData: any = { updatedAt: new Date() };
     if (updates.name !== undefined) updateData.name = updates.name;
-    if (updates.avatarUrl !== undefined) updateData.avatarUrl = updates.avatarUrl;
+    if (updates.avatarUrl !== undefined) {
+      updateData.avatarUrl = updates.avatarUrl || null;
+    }
     
     // Update profile
     const updated = await db
@@ -191,7 +227,7 @@ profile.patch("/update", async (c) => {
       .returning();
     
     if (!updated[0]) {
-      return c.json({ error: "User not found" }, 404);
+      return c.json({ error: "Failed to update profile" }, 500);
     }
     
     return c.json({

@@ -5,6 +5,9 @@ import { users } from "../db/schema";
 import { eq } from "drizzle-orm";
 import { createSession, destroySession, getSession } from "../lib/session";
 import { setCookie, getCookie, deleteCookie } from "hono/cookie";
+import { z } from "zod";
+import deactivateRouter from "./routes/deactivate";
+import deleteRouter from "./routes/delete";
 
 const auth = new Hono();
 
@@ -17,20 +20,25 @@ const google = new Google(
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
+// Validation schemas
+const callbackQuerySchema = z.object({
+  code: z.string().min(1),
+  state: z.string().min(1),
+});
+
 // GET /auth/google - Initiate OAuth flow
 auth.get("/google", async (c) => {
   const state = generateState();
   const codeVerifier = generateCodeVerifier();
   
   const url = await google.createAuthorizationURL(state, codeVerifier, {
-    scopes: ["email"], // Minimal scope - only email
+    scopes: ["email"],
   });
   
-  // Store state and verifier in cookies for validation
   setCookie(c, "google_oauth_state", state, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    maxAge: 60 * 10, // 10 minutes
+    maxAge: 60 * 10,
     path: "/",
   });
   
@@ -51,7 +59,7 @@ auth.get("/google/callback", async (c) => {
   const storedState = getCookie(c, "google_oauth_state");
   const codeVerifier = getCookie(c, "google_code_verifier");
   
-  // Validate state to prevent CSRF
+  // Validate OAuth parameters
   if (!code || !state || !storedState || state !== storedState || !codeVerifier) {
     return c.redirect(`${FRONTEND_URL}/auth/error?message=Invalid OAuth state`);
   }
@@ -78,6 +86,11 @@ auth.get("/google/callback", async (c) => {
       email: string;
     };
     
+    // Validate Google user data
+    if (!googleUser.id || !googleUser.email) {
+      throw new Error("Invalid user data from Google");
+    }
+    
     // Check if user exists by Google ID
     const existingUser = await db.query.users.findFirst({
       where: eq(users.googleId, googleUser.id),
@@ -94,7 +107,7 @@ auth.get("/google/callback", async (c) => {
       return c.redirect(`${FRONTEND_URL}/home`);
     }
     
-    // New user - check if email already exists (different Google account)
+    // New user - check if email already exists
     const emailExists = await db.query.users.findFirst({
       where: eq(users.email, googleUser.email),
     });
@@ -103,13 +116,13 @@ auth.get("/google/callback", async (c) => {
       return c.redirect(`${FRONTEND_URL}/auth/error?message=Email already registered with different account`);
     }
     
-    // Create new user with minimal info
+    // Create new user
     const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     await db.insert(users).values({
       id: userId,
       googleId: googleUser.id,
       email: googleUser.email,
-      name: null, // User will set this in profile setup
+      name: null,
       avatarUrl: null,
       userType: "normal",
       superlikesRemaining: 3,
@@ -153,7 +166,8 @@ auth.get("/session", async (c) => {
         name: user.name,
         avatarUrl: user.avatarUrl,
         userType: user.userType,
-        needsProfileSetup: !user.name, // Flag for frontend
+        superlikesRemaining: user.superlikesRemaining,
+        needsProfileSetup: !user.name,
       },
     });
   } catch (error) {
@@ -167,5 +181,9 @@ auth.post("/logout", async (c) => {
   destroySession(c);
   return c.json({ success: true, message: "Logged out successfully" });
 });
+
+// Mount admin routes
+auth.route("/deactivate", deactivateRouter);
+auth.route("/delete", deleteRouter);
 
 export default auth;

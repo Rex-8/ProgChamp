@@ -7,4 +7,8 @@ const client = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN!,
 });
 
+client.execute("PRAGMA foreign_keys = ON").catch((err) => {
+  console.error("Failed to enable foreign keys:", err);
+});
+
 export const db = drizzle(client, { schema });
