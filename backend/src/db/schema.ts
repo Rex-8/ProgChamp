@@ -9,7 +9,7 @@ export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   googleId: text("google_id").unique().notNull(),
   email: text("email").unique().notNull(),
-  name: text("name").notNull(),
+  name: text("name"),
   avatarUrl: text("avatar_url"),
   userType: text("user_type", { enum: ["normal", "admin"] }).default("normal").notNull(),
   
